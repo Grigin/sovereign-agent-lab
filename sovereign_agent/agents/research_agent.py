@@ -69,7 +69,7 @@ load_dotenv()
 llm = ChatOpenAI(
     base_url="https://api.tokenfactory.nebius.com/v1/",
     api_key=os.getenv("NEBIUS_KEY"),
-    model="meta-llama/Llama-3.3-70B-Instruct",
+    model="Qwen/Qwen3-32B",
     temperature=0,
 )
 
@@ -122,7 +122,19 @@ def run_research_agent(task: str, max_turns: int = 8) -> dict:
         role    = getattr(m, "type", "unknown")
         content = m.content
 
-        # Tool-call messages have structured list content
+        # OpenAI-style tool calls live on m.tool_calls (not in content).
+        # AIMessage with tool calls usually has empty content + populated tool_calls.
+        if role == "ai" and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                entry = {
+                    "tool": tc["name"],
+                    "args": tc.get("args", {}),
+                }
+                tool_calls_made.append(entry)
+                full_trace.append({"role": "tool_call", **entry})
+            # Fall through so any text content alongside tool_calls is also captured.
+
+        # Anthropic-style tool_use blocks come in as a list in content
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
