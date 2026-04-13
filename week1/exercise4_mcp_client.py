@@ -37,6 +37,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from langchain_core.tools import StructuredTool
@@ -44,6 +45,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from pydantic import create_model
 
 load_dotenv()
 
@@ -78,6 +80,25 @@ def _make_mcp_caller(tool_name: str, server_script: str):
     return call
 
 
+def _mcp_schema_to_pydantic(tool_name: str, input_schema: dict):
+    """Build a Pydantic model from an MCP tool's inputSchema so that
+    StructuredTool forwards args correctly.  Without this, the tool
+    receives {} regardless of what the model sends.
+    See upstream issue #7: https://github.com/sovereignagents/sovereign-agent-lab/issues/7
+    """
+    type_map = {"string": str, "integer": int, "boolean": bool, "number": float}
+    fields = {}
+    props = input_schema.get("properties", {})
+    required = set(input_schema.get("required", []))
+    for name, info in props.items():
+        py_type = type_map.get(info.get("type", "string"), Any)
+        if name in required:
+            fields[name] = (py_type, ...)
+        else:
+            fields[name] = (py_type, None)
+    return create_model(f"{tool_name}Args", **fields)
+
+
 async def discover_tools(server_script: str) -> list:
     """
     Connect once, list all tools, and wrap each as a LangChain StructuredTool.
@@ -97,6 +118,7 @@ async def discover_tools(server_script: str) -> list:
                     func=_make_mcp_caller(t.name, server_script),
                     name=t.name,
                     description=t.description or f"MCP tool: {t.name}",
+                    args_schema=_mcp_schema_to_pydantic(t.name, t.inputSchema or {}),
                 )
                 tools.append(lc_tool)
             return tools, [t.name for t in raw.tools]
@@ -109,6 +131,14 @@ def extract_trace(result: dict) -> list:
     for m in result["messages"]:
         role    = getattr(m, "type", "unknown")
         content = m.content
+
+        # OpenAI-style tool calls live on m.tool_calls (upstream issue #2)
+        if role == "ai" and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                trace.append({"role": "tool_call", "tool": tc["name"],
+                              "args": tc.get("args", {})})
+
+        # Anthropic-style tool_use blocks come in as a list in content
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -135,7 +165,7 @@ async def main() -> None:
     llm = ChatOpenAI(
         base_url="https://api.tokenfactory.nebius.com/v1/",
         api_key=os.getenv("NEBIUS_KEY"),
-        model="meta-llama/Llama-3.3-70B-Instruct",
+        model="Qwen/Qwen3-32B",  # Llama 3.3 70B breaks tool calls — upstream issue #2
         temperature=0,
     )
 
